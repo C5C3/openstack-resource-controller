@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 
+	corev1 "k8s.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -38,6 +39,22 @@ const controllerName = "applicationcredential"
 
 // +kubebuilder:rbac:groups=openstack.k-orc.cloud,resources=applicationcredentials,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=openstack.k-orc.cloud,resources=applicationcredentials/status,verbs=get;update;patch
+
+var (
+	// We don't need a deletion guard on the application credential secret because it's only
+	// used on creation.
+	secretDependency = dependency.NewDependency[*orcv1alpha1.ApplicationCredentialList, *corev1.Secret](
+		"spec.resource.secret.secretRef",
+		func(applicationcredential *orcv1alpha1.ApplicationCredential) []string {
+			resource := applicationcredential.Spec.Resource
+			if resource == nil || resource.Secret.SecretRef == nil {
+				return nil
+			}
+
+			return []string{string(*resource.Secret.SecretRef)}
+		},
+	)
+)
 
 type applicationcredentialReconcilerConstructor struct {
 	scopeFactory scope.Factory
@@ -58,7 +75,7 @@ var userDependency = dependency.NewDeletionGuardDependency[*orcv1alpha1.Applicat
 		if resource == nil {
 			return nil
 		}
-		return []string{string(resource.UserRef)}
+		return []string{string(*resource.UserRef)}
 	},
 	finalizer, externalObjectFieldOwner,
 )
@@ -85,6 +102,8 @@ func (c applicationcredentialReconcilerConstructor) SetupWithManager(ctx context
 	}
 
 	userImportWatchEventHandler, err := userImportDependency.WatchEventHandler(log, k8sClient)
+
+	secretWatchEventHandler, err := secretDependency.WatchEventHandler(log, k8sClient)
 	if err != nil {
 		return err
 	}
@@ -98,12 +117,21 @@ func (c applicationcredentialReconcilerConstructor) SetupWithManager(ctx context
 		Watches(&orcv1alpha1.User{}, userImportWatchEventHandler,
 			builder.WithPredicates(predicates.NewBecameAvailable(log, &orcv1alpha1.User{})),
 		).
+		// XXX: This is a general watch on secrets. A general watch on secrets
+		// is undesirable because:
+		// - It requires problematic RBAC
+		// - Secrets are arbitrarily large, and we don't want to cache their contents
+		//
+		// These will require separate solutions. For the latter we should
+		// probably use a MetadataOnly watch only secrets.
+		Watches(&corev1.Secret{}, secretWatchEventHandler).
 		For(&orcv1alpha1.ApplicationCredential{})
 
 	if err := errors.Join(
 		userDependency.AddToManager(ctx, mgr),
 		userImportDependency.AddToManager(ctx, mgr),
 		credentialsDependency.AddToManager(ctx, mgr),
+		secretDependency.AddToManager(ctx, mgr),
 		credentials.AddCredentialsWatch(log, mgr.GetClient(), builder, credentialsDependency),
 	); err != nil {
 		return err
